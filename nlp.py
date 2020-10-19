@@ -62,11 +62,9 @@ features, dataset = squad_convert_examples_to_features(
 output_dir = "./models/squad"
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
-export_model_path = os.path.join(output_dir, 'bert-base-cased-squad_opset{}.onnx'.format(opset_version))
 
 
 use_gpu = torch.cuda.is_available()
-use_gpu = False
 device = torch.device("cuda" if use_gpu else "cpu")
 
 # Get the first example data to run the model and export it to ONNX
@@ -81,13 +79,16 @@ inputs = {
 # inference and training mode.
 model.eval()
 model.to(device)
+# torch.save(model.state_dict(), os.join(output_dir, 'bert-base-case-squad.pt')
+export_model_path_dynamic = os.path.join(output_dir, 'bert-base-cased-squad_dynamic_opset{}.onnx'.format(opset_version))
+export_model_path = os.path.join(output_dir, 'bert-base-cased-squad_opset{}.onnx'.format(opset_version))
 
 if enable_overwrite or not os.path.exists(export_model_path):
     with torch.no_grad():
         symbolic_names = {0: 'batch_size', 1: 'max_seq_len'}
         torch.onnx.export(model,                                            # model being run
                           args=tuple(inputs.values()),                      # model input (or a tuple for multiple inputs)
-                          f=export_model_path,                              # where to save the model (can be a file or file-like object)
+                          f=export_model_path_dynamic,                              # where to save the model (can be a file or file-like object)
                           opset_version=opset_version,                      # the ONNX version to export the model to
                           do_constant_folding=True,                         # whether to execute constant folding for optimization
                           input_names=['input_ids',                         # the model's input names
@@ -99,6 +100,17 @@ if enable_overwrite or not os.path.exists(export_model_path):
                                         'segment_ids' : symbolic_names,
                                         'start' : symbolic_names,
                                         'end' : symbolic_names})
+        # Now do non-dynamic axis
+        torch.onnx.export(model,  # model being run
+                          args=tuple(inputs.values()),  # model input (or a tuple for multiple inputs)
+                          f=export_model_path,  # where to save the model (can be a file or file-like object)
+                          opset_version=opset_version,  # the ONNX version to export the model to
+                          do_constant_folding=True,  # whether to execute constant folding for optimization
+                          input_names=['input_ids',  # the model's input names
+                                       'input_mask',
+                                       'segment_ids'],
+                          output_names=['start', 'end'],  # the model's output names
+                          )
         print("Model exported at ", export_model_path)
 
 # Measure the latency. It is not accurate using Jupyter Notebook, it is recommended to use standalone python script.
@@ -115,37 +127,42 @@ with torch.no_grad():
         outputs = model(**inputs)
         latency.append(time.time() - start)
 print("PyTorch {} Inference time = {} ms".format(device.type, format(sum(latency) * 1000 / len(latency), '.2f')))
-
-assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
-device_name = 'cpu'
+ep_list = onnxruntime.get_available_providers()
+assert 'CUDAExecutionProvider' in ep_list
+device_name = device
 sess_options = onnxruntime.SessionOptions()
+ep_dev_map = {'CUDAExecutionProvider': "cuda", 'CPUExecutionProvider': "cpu"}
+for ep in ep_list:
+    dev = ep_dev_map.get(ep)
+    dynamic = {"non_dynamic": export_model_path, "dynamic": export_model_path_dynamic}
+    for k, v in dynamic.items():
+        print(k)
+        # This will save the optimized graph to the directory specified in optimized_model_filepath
+        sess_options.optimized_model_filepath = os.path.join(output_dir, "optimized_model_{}.onnx".format(dev))
 
-# This will save the optimized graph to the directory specified in optimized_model_filepath
-sess_options.optimized_model_filepath = os.path.join(output_dir, "optimized_model_{}.onnx".format(device_name))
 
-# Optional: store the optimized graph and view it using Netron to verify that model is fully optimized.
-# Note that this will increase session creation time so enable it for debugging only.
+        # Optional: store the optimized graph and view it using Netron to verify that model is fully optimized.
+        # Note that this will increase session creation time so enable it for debugging only.
+        optimized_model = optimizer.optimize_model(v, model_type='bert', num_heads=12, hidden_size=768)
+        optimized_model.save_model_to_file(sess_options.optimized_model_filepath)
 
-optimized_model = optimizer.optimize_model(export_model_path, model_type='bert', num_heads=12, hidden_size=768)
-# optimized_model.save_model_to_file(sess_options.optimized_model_filepath)
+        # Please change the value according to best setting in Performance Test Tool result.
+        sess_options.intra_op_num_threads = psutil.cpu_count(logical=True)
 
-# Please change the value according to best setting in Performance Test Tool result.
-sess_options.intra_op_num_threads = psutil.cpu_count(logical=True)
+        session = onnxruntime.InferenceSession(sess_options.optimized_model_filepath, sess_options)
+        session.set_providers([ep])
+        latency = []
+        for i in range(total_samples):
+            data = dataset[i]
+            # TODO: use IO Binding (see https://github.com/microsoft/onnxruntime/pull/4206) to improve performance.
+            ort_inputs = {
+                'input_ids': data[0].cpu().reshape(1, max_seq_length).numpy(),
+                'input_mask': data[1].cpu().reshape(1, max_seq_length).numpy(),
+                'segment_ids': data[2].cpu().reshape(1, max_seq_length).numpy()
+            }
+            start = time.time()
+            ort_outputs = session.run(None, ort_inputs)
+            latency.append(time.time() - start)
 
-session = onnxruntime.InferenceSession(sess_options.optimized_model_filepath, sess_options)
-session.set_providers(['CPUExecutionProvider'])
-latency = []
-for i in range(total_samples):
-    data = dataset[i]
-    # TODO: use IO Binding (see https://github.com/microsoft/onnxruntime/pull/4206) to improve performance.
-    ort_inputs = {
-        'input_ids': data[0].cpu().reshape(1, max_seq_length).numpy(),
-        'input_mask': data[1].cpu().reshape(1, max_seq_length).numpy(),
-        'segment_ids': data[2].cpu().reshape(1, max_seq_length).numpy()
-    }
-    start = time.time()
-    ort_outputs = session.run(None, ort_inputs)
-    latency.append(time.time() - start)
-
-print("OnnxRuntime {} Inference time = {} ms".format(device_name, format(sum(latency) * 1000 / len(latency), '.2f')))
+        print("OnnxRuntime {}, {} Inference time = {} ms".format(dev, k, format(sum(latency) * 1000 / len(latency), '.2f')))
 print('done')

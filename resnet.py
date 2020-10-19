@@ -14,10 +14,13 @@ from PIL import Image
 from torchvision import transforms
 import time
 
-
+use_gpu = torch.cuda.is_available()
+device = torch.device("cuda" if use_gpu else "cpu")
+# device = 'cpu'
 # Talk about
 # 1. tracing vs. scripting
-# https://pytorch.org/docs/stable/onnx.html
+# https://pytorch.org/docs/stable/onnx.
+
 # 2. Use of external data format
 # 3. Training vs. Evaluation mode
 def export_to_onnx_pt(model, batch, use_dynamic=True, use_external=False):
@@ -114,20 +117,24 @@ resnet.eval()
 
 img = load_data("dog.jpg")
 # Convert image into Pytorch and Tensorflow batch
-batch_tf = prepare_data_tf(img)
+# batch_tf = prepare_data_tf(img)
 batch_pt = prepare_data_pt(img)
 
 # Export to ONNX format
 export_to_onnx_pt(resnet, batch_pt, use_dynamic=False, use_external=False)
+export_to_onnx_pt(resnet, batch_pt, use_dynamic=True, use_external=False)
+
+# prime the data transfer:
+torch.rand((12, 3, 224, 224)).to(device)
 
 # Run resnet101 on the batch and record execution time
 start = time.time()
-# out_1 = resnet(batch_pt)
+resnet.to(device)
+print('Model data transfer time: {0}'.format(time.time() - start))
+out_1 = resnet(batch_pt.to(device))
 # out_2 = torch.nn.functional.softmax(out_1[0], dim=0)
 print('Resnet-101 (regular) execution: {0}'.format(time.time() - start))
 
-## load onnx model
-onnx_model = onnx.load("models/resnet.onnx")  # load onnx model
 
 #####################################
 # Convert back onnx to pytorch and run pytorch model on the data
@@ -142,40 +149,35 @@ start = time.time()
 # output = tf_model.run(batch_tf)
 print('Resnet-101 Tensorflow execution (B=64): {0}'.format(time.time() - start))
 #####################################
-print(onnxruntime.__version__)
-# Now run ONNX model directly
+
+################################################################
+# Now use ONNX Runtime
 ep_list = onnxruntime.get_available_providers()
-
-device_name = 'cpu'
 sess_options = onnxruntime.SessionOptions()
-# This will save the optimized graph to the directory specified in optimized_model_filepath
-sess_options.optimized_model_filepath = os.path.join("./models", "resnet_optimized_model_{}.onnx".format(device_name))
-# optimized_model = optimizer.optimize_model(export_model_path, model_type='bert', num_heads=12, hidden_size=768)
-# optimized_model.save_model_to_file(sess_options.optimized_model_filepath)
-ort_session = onnxruntime.InferenceSession("models/resnet.onnx", sess_options)
+ep_dev_map = {'CUDAExecutionProvider': "cuda", 'CPUExecutionProvider': "cpu"}
+output_dir = "models"
+for i in range(0,2):
+    for ep in ep_list:
+        dev = ep_dev_map.get(ep)
+        dynamic = {"non_dynamic": "models/resnet.onnx", "dynamic": "models/resnet_dynamic.onnx"}
+        for k, v in dynamic.items():
 
-def to_numpy(tensor):
-    return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
+            # This will save the optimized graph to the directory specified in optimized_model_filepath
+            sess_options.optimized_model_filepath = os.path.join(output_dir, "resnet_optimized_model_{}.onnx".format(dev))
+            ort_session = onnxruntime.InferenceSession(v, sess_options)
+            # get the outputs metadata as a list of :class:`onnxruntime.NodeArg`
+            output_name = ort_session.get_outputs()[0].name
+            # get the inputs metadata as a list of :class:`onnxruntime.NodeArg`
+            input_name = ort_session.get_inputs()[0].name
 
-# compute ONNX Runtime output prediction
-start = time.time()
-# get the outputs metadata as a list of :class:`onnxruntime.NodeArg`
-output_name = ort_session.get_outputs()[0].name
+            def to_numpy(tensor):
+                return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
-# get the inputs metadata as a list of :class:`onnxruntime.NodeArg`
-input_name = ort_session.get_inputs()[0].name
-ort_inputs = {input_name: to_numpy(batch_pt)}
+            ort_inputs = {input_name: to_numpy(batch_pt)}
+            ort_session.set_providers([ep]) # ep: Execution Provider - eg., CUDAExecutionProvider, CPUExecutionProvider
+            # compute ONNX Runtime output prediction
+            start = time.time()
+            ort_outs = ort_session.run([output_name], ort_inputs)
+            print("Resnet-101 OnnxRuntime {}, {} Inference time = {} ms".format(dev, k, time.time() - start))
 
-ort_session.set_providers(['CPUExecutionProvider'])
 
-# get the outputs metadata as a list of :class:`onnxruntime.NodeArg`
-output_name = ort_session.get_outputs()[0].name
-ort_outs = ort_session.run([output_name], ort_inputs)
-print('Resnet-101 (ONNX) execution: {0}'.format(time.time() - start))
-
-# with open('imagenet_classes.txt') as f:
-#    labels = [line.strip() for line in f.readlines()]
-
-#_, index = torch.max(out, 1)
-# print(labels[index[0]])
-print("Exported model has been tested with ONNXRuntime, and the result looks good!")
